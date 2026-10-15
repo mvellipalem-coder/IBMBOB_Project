@@ -264,7 +264,10 @@ class OpenApiSpecTest {
             assertThat(reasonPhraseOk(value.get("status").asInt(), value.get("error").asText()))
                 .as(exampleName + " status/error text").isTrue();
         });
-        assertThat(usedCodes).as("declared error codes with no example").containsAll(new HashSet<>(codes));
+        // FORBIDDEN (403) is reserved for role checks; no endpoint is restricted by role yet (ownership gives 404).
+        Set<String> expectedWithExample = new HashSet<>(codes);
+        expectedWithExample.remove("FORBIDDEN");
+        assertThat(usedCodes).as("declared error codes with no example").containsAll(expectedWithExample);
         assertThat(raw).doesNotContain("stackTrace", "Exception", "SELECT ");
     }
 

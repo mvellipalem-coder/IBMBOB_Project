@@ -5,6 +5,7 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -98,8 +99,16 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ErrorResponse> handleUnreadableBody(HttpMessageNotReadableException ex,
                                                               HttpServletRequest request) {
-        log.debug("Unreadable request body on {}", request.getRequestURI(), ex);
+        // Log only the exception type: a request body (for example a login) may contain a password.
+        log.debug("Unreadable request body on {} ({})", request.getRequestURI(), ex.getClass().getSimpleName());
         return build(ErrorCode.VALIDATION_FAILED, "The request body is missing or malformed.", request, null);
+    }
+
+    /** The user is logged in but not allowed to do this (for example a {@code @PreAuthorize} check failed). */
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ErrorResponse> handleAccessDenied(AccessDeniedException ex, HttpServletRequest request) {
+        log.warn("Access denied on {}", request.getRequestURI());
+        return build(ErrorCode.FORBIDDEN, ErrorCode.FORBIDDEN.getDefaultMessage(), request, null);
     }
 
     /** No endpoint exists for this URL. Reported as 404 without revealing anything about the server. */

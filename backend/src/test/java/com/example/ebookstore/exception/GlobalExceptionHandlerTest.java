@@ -10,7 +10,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.test.context.support.WithMockUser;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -20,6 +22,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.example.ebookstore.config.SecurityConfig;
+import com.example.ebookstore.security.JwtAuthenticationConverter;
+import com.example.ebookstore.security.RestAccessDeniedHandler;
 import com.example.ebookstore.security.RestAuthenticationEntryPoint;
 
 import jakarta.validation.Valid;
@@ -29,15 +33,22 @@ import jakarta.validation.constraints.NotBlank;
  * Checks that every kind of failure becomes the standard error body, using a tiny throw-away controller.
  * No database is needed.
  */
-@WebMvcTest
+@WebMvcTest(GlobalExceptionHandlerTest.ThrowingController.class)
 @Import({GlobalExceptionHandlerTest.ThrowingController.class, SecurityConfig.class,
-        RestAuthenticationEntryPoint.class, GlobalExceptionHandler.class})
+        RestAuthenticationEntryPoint.class, RestAccessDeniedHandler.class,
+        GlobalExceptionHandler.class})
 @TestPropertySource(properties = "app.cors.allowed-origin=http://localhost:5173")
 @WithMockUser
 class GlobalExceptionHandlerTest {
 
     @Autowired
     private MockMvc mockMvc;
+
+    @MockitoBean
+    private JwtDecoder jwtDecoder;
+
+    @MockitoBean
+    private JwtAuthenticationConverter jwtAuthenticationConverter;
 
     @Test
     void apiExceptionUsesTheStatusAndCodeOfItsErrorCode() throws Exception {

@@ -7,6 +7,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
@@ -15,27 +16,45 @@ import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
+import com.example.ebookstore.security.JwtAuthenticationConverter;
+import com.example.ebookstore.security.RestAccessDeniedHandler;
 import com.example.ebookstore.security.RestAuthenticationEntryPoint;
 
 /**
  * Who may call what. The public/protected split matches {@code security: []} in openapi.yaml:
  * registration, login, the whole catalogue and the API documentation are public; everything else needs a JWT.
  *
- * <p>The JWT login and token checking are added together with the authentication feature.
- * Until then every protected URL answers {@code 401}.
+ * <p>How a request is authenticated:
+ * <ol>
+ *   <li>The client sends {@code Authorization: Bearer <token>}.</li>
+ *   <li>Spring's resource-server filter verifies the signature, expiry and issuer ({@link JwtConfig}).</li>
+ *   <li>{@link JwtAuthenticationConverter} loads the user from the database and builds the
+ *       {@code AuthenticatedUser} principal.</li>
+ *   <li>Missing/invalid token: {@code 401}. Logged in but role not allowed: {@code 403}. Both as JSON.</li>
+ * </ol>
+ * Security is never switched off; tests log in with real tokens.
  */
 @Configuration
+@EnableMethodSecurity
 public class SecurityConfig {
 
     @Bean
-    SecurityFilterChain securityFilterChain(HttpSecurity http, RestAuthenticationEntryPoint entryPoint)
+    SecurityFilterChain securityFilterChain(HttpSecurity http, RestAuthenticationEntryPoint entryPoint,
+                                            RestAccessDeniedHandler accessDeniedHandler,
+                                            JwtAuthenticationConverter jwtAuthenticationConverter)
             throws Exception {
         http
             // The API is stateless and uses an Authorization header, not cookies, so CSRF does not apply.
             .csrf(AbstractHttpConfigurer::disable)
             .cors(Customizer.withDefaults())
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-            .exceptionHandling(e -> e.authenticationEntryPoint(entryPoint))
+            .oauth2ResourceServer(oauth -> oauth
+                .jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthenticationConverter))
+                .authenticationEntryPoint(entryPoint)
+                .accessDeniedHandler(accessDeniedHandler))
+            .exceptionHandling(e -> e
+                .authenticationEntryPoint(entryPoint)
+                .accessDeniedHandler(accessDeniedHandler))
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers(HttpMethod.GET, "/api/health").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/auth/register", "/api/auth/login").permitAll()

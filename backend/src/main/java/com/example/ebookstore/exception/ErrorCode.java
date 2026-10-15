@@ -13,6 +13,7 @@ public enum ErrorCode {
 
     VALIDATION_FAILED(HttpStatus.BAD_REQUEST, "Request validation failed."),
     UNAUTHORIZED(HttpStatus.UNAUTHORIZED, "Authentication is required."),
+    FORBIDDEN(HttpStatus.FORBIDDEN, "You do not have permission to do this."),
     INVALID_CREDENTIALS(HttpStatus.UNAUTHORIZED, "Invalid e-mail or password."),
     EMAIL_ALREADY_REGISTERED(HttpStatus.CONFLICT, "This e-mail address is already registered."),
     TOO_MANY_REQUESTS(HttpStatus.TOO_MANY_REQUESTS, "Too many attempts. Try again later."),

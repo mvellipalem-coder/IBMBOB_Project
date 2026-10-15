@@ -5,10 +5,11 @@ Stack: Java 21, Spring Boot 4.1 + Maven + PostgreSQL (backend), React + Vite (fr
 
 - Plan: [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)
 - Database design: [docs/DATABASE_DESIGN.md](docs/DATABASE_DESIGN.md)
+- Authentication and authorization (samples, Swagger UI steps): [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md)
 - API contract: [backend/src/main/resources/openapi.yaml](backend/src/main/resources/openapi.yaml)
 
-Current status: **backend scaffold** complete (structure, configuration, security baseline, error handling,
-database migrations). Business features are added next.
+Current status: backend scaffold, database migrations and **authentication** (register, login with JWT,
+`GET /api/users/me`) are done. Catalogue, cart, orders and the other features are added next.
 
 ## Prerequisites
 - Java 21 (set `JAVA_HOME` to the JDK 21 folder)

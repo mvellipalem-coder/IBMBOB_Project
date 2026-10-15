@@ -1447,6 +1447,7 @@ components:
           enum:
             - VALIDATION_FAILED
             - UNAUTHORIZED
+            - FORBIDDEN
             - INVALID_CREDENTIALS
             - EMAIL_ALREADY_REGISTERED
             - TOO_MANY_REQUESTS
