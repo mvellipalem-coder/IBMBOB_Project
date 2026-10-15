@@ -1,16 +1,20 @@
 # EBookStore
 
 E-commerce bookstore: browse, search, buy and manage book orders.
-Stack: Spring Boot + Maven + PostgreSQL (backend), React + Vite (frontend), OpenAPI 3 / Swagger UI, JUnit 5 + Mockito.
+Stack: Java 21, Spring Boot 4.1 + Maven + PostgreSQL (backend), React + Vite (frontend), OpenAPI 3 / Swagger UI, JUnit 5 + Mockito.
 
-See [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md) for requirements, architecture and phases.
-Current status: **Phase 0 (project setup)** complete.
+- Plan: [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)
+- Database design: [docs/DATABASE_DESIGN.md](docs/DATABASE_DESIGN.md)
+- API contract: [backend/src/main/resources/openapi.yaml](backend/src/main/resources/openapi.yaml)
+
+Current status: **backend scaffold** complete (structure, configuration, security baseline, error handling,
+database migrations). Business features are added next.
 
 ## Prerequisites
 - Java 21 (set `JAVA_HOME` to the JDK 21 folder)
 - Maven 3.9+
 - PostgreSQL (latest supported version)
-- Node.js (current LTS) and npm
+- Node.js (current LTS) and npm (frontend only)
 - Git
 
 ## 1. Database
@@ -18,20 +22,24 @@ Current status: **Phase 0 (project setup)** complete.
 CREATE USER ebookstore WITH PASSWORD '<choose-a-strong-password>';
 CREATE DATABASE ebookstore OWNER ebookstore;
 ```
+Flyway creates the tables and sample books automatically on first start.
 
 ## 2. Run the backend
 PowerShell:
 ```powershell
 cd backend
 $env:DB_PASSWORD = "<the-password-you-chose>"
+$env:JWT_SECRET  = "<random-string-of-at-least-32-characters>"
 mvn spring-boot:run
 ```
-- Health check: http://localhost:8080/api/v1/health
+The server listens on 127.0.0.1 only.
+- Health check: http://localhost:8080/api/health
 - Swagger UI: http://localhost:8080/swagger-ui.html
-- OpenAPI JSON: http://localhost:8080/v3/api-docs
+- OpenAPI contract: http://localhost:8080/openapi.yaml
 
-Other settings (optional): `DB_URL`, `DB_USERNAME`, `CORS_ALLOWED_ORIGIN` (see [.env.example](.env.example)).
-Never commit real passwords or secrets.
+`DB_PASSWORD` and `JWT_SECRET` are required; the app refuses to start without them.
+Optional settings (`DB_URL`, `DB_USERNAME`, `SERVER_PORT`, `JWT_EXPIRATION_SECONDS`, `CORS_ALLOWED_ORIGIN`)
+are listed in [.env.example](.env.example). Never commit real passwords or secrets.
 
 ## 3. Run the frontend
 ```powershell
@@ -46,6 +54,20 @@ Open http://localhost:5173. The home page shows the backend status.
 cd backend
 mvn test
 ```
+Tests start an embedded PostgreSQL automatically, so no database setup is needed for them.
+
+## Backend packages (`com.example.ebookstore`)
+| Package | Responsibility |
+|---|---|
+| `config` | Spring configuration: security, OpenAPI/Swagger, typed settings |
+| `controller` | HTTP endpoints; use DTOs only |
+| `dto` | Request/response objects that match the OpenAPI contract |
+| `entity` | JPA classes mapped to database tables |
+| `exception` | Error codes and the central `@RestControllerAdvice` |
+| `mapper` | Entity <-> DTO conversion |
+| `repository` | Spring Data JPA interfaces |
+| `security` | JWT and authentication helpers |
+| `service` / `service.impl` | Business rules and transactions |
 
 ## Project layout
 ```

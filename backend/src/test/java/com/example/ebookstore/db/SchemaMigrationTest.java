@@ -1,4 +1,4 @@
-package com.ebookstore.db;
+package com.example.ebookstore.db;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;

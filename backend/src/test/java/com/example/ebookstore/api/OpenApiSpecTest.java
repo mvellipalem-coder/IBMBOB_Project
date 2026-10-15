@@ -1,4 +1,4 @@
-package com.ebookstore.api;
+package com.example.ebookstore.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
