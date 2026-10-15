@@ -19,26 +19,29 @@ database migrations). Business features are added next.
 
 ## 1. Database
 ```sql
-CREATE USER ebookstore WITH PASSWORD '<choose-a-strong-password>';
-CREATE DATABASE ebookstore OWNER ebookstore;
+CREATE USER ebookstore_user WITH PASSWORD '<choose-a-strong-password>';
+CREATE DATABASE ebookstore_db OWNER ebookstore_user ENCODING 'UTF8';
 ```
 Flyway creates the tables and sample books automatically on first start.
+Full guide (environment variables, profiles, verification, troubleshooting): [docs/DATABASE_SETUP.md](docs/DATABASE_SETUP.md).
 
 ## 2. Run the backend
 PowerShell:
 ```powershell
 cd backend
+$env:SPRING_PROFILES_ACTIVE = "dev"
 $env:DB_PASSWORD = "<the-password-you-chose>"
 $env:JWT_SECRET  = "<random-string-of-at-least-32-characters>"
 mvn spring-boot:run
 ```
-The server listens on 127.0.0.1 only.
+The `dev` profile defaults `DB_URL` to `jdbc:postgresql://localhost:5432/ebookstore_db` and `DB_USERNAME` to `ebookstore_user`.
+Without a profile, `DB_URL` and `DB_USERNAME` must be set too. The server listens on 127.0.0.1 only.
 - Health check: http://localhost:8080/api/health
 - Swagger UI: http://localhost:8080/swagger-ui.html
 - OpenAPI contract: http://localhost:8080/openapi.yaml
 
 `DB_PASSWORD` and `JWT_SECRET` are required; the app refuses to start without them.
-Optional settings (`DB_URL`, `DB_USERNAME`, `SERVER_PORT`, `JWT_EXPIRATION_SECONDS`, `CORS_ALLOWED_ORIGIN`)
+Optional settings (`SERVER_PORT`, `JWT_EXPIRATION_SECONDS`, `CORS_ALLOWED_ORIGIN`)
 are listed in [.env.example](.env.example). Never commit real passwords or secrets.
 
 ## 3. Run the frontend
