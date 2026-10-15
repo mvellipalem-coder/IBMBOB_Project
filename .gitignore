@@ -1,0 +1,26 @@
+﻿# Secrets - never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Java / Maven
+target/
+*.class
+*.log
+
+# Node / React
+node_modules/
+dist/
+.vite/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Bob local files
+.bob/
