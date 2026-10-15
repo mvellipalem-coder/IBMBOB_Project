@@ -1,0 +1,3009 @@
+openapi: 3.0.3
+info:
+  title: EBookStore API
+  version: 1.0.0
+  description: |
+    REST API for the EBookStore e-commerce bookstore (browse, search, cart, checkout,
+    simulated payment, gift points, orders, recommendations).
+
+    ## Conventions
+
+    **Authentication.** Protected operations need `Authorization: Bearer <JWT>`, obtained from
+    `POST /api/auth/login`. Public operations (registration, login and the whole catalogue) are marked
+    with an empty `security` list. All protected operations are available to any authenticated
+    user (`CUSTOMER` or `ADMIN`); no operation in this document needs a role check, so there is no `403`.
+
+    **Ownership.** Carts, addresses, orders, payments and gift points always belong to the
+    authenticated user, taken from the token and never from the request. A resource that belongs to
+    another user is reported as `404`, exactly like a resource that does not exist.
+
+    **Server-side trust.** Clients never send prices, totals, point values, order or payment status.
+    The server recomputes everything from the cart and the database. Request bodies that can change
+    money-related state use `additionalProperties: false`, so unknown fields are rejected with `400`.
+    The payment gateway is simulated and its outcome is decided only by the server.
+
+    **Money** is a JSON number with at most 2 decimal places (database type `NUMERIC`), in a single
+    currency. **Timestamps** are ISO 8601 UTC (`date-time`); `expectedDeliveryDate` is a plain `date`.
+
+    **Pagination** uses `page` (0-based) and `size` (1 to 100, default 20). Paged responses carry
+    `page`, `size`, `totalElements`, `totalPages`, `first`, `last` and `content`.
+
+    **Errors** always use the `ErrorResponse` schema with a stable machine-readable `code`.
+    Responses never contain stack traces, SQL, or internal class names.
+
+    **Idempotency.** `POST /api/checkout` and `POST /api/payments/{orderId}/process` require an
+    `Idempotency-Key` header (see the `IdempotencyKey` parameter). Cancel and buy-again are idempotent
+    by design (see each operation).
+
+    ## Business rules summarised
+
+    | Rule | Value |
+    |---|---|
+    | Max quantity per cart line | 10 (and never more than stock) |
+    | Max saved addresses per user | 10 |
+    | Gift point value | 1 point = 1.00 currency unit |
+    | Max share of an order payable with points | 50% of the subtotal, rounded down to whole points |
+    | Points earned | 1 point per 10.00 of amount paid, credited when the order is `DELIVERED` |
+    | Tentative delivery date | order date + 5 days (+2 days for remote postal codes) |
+    | Cancellation | status `PLACED`, `CONFIRMED` or `PACKED` **and** less than 48 hours after `createdAt` |
+    | Unpaid CARD/UPI order | auto-cancelled 30 minutes after creation if payment was not processed |
+
+    The values above are server configuration; the live values for points are returned by
+    `GET /api/gift-points/balance`.
+servers:
+  - url: http://localhost:8080
+    description: Local development only (the API binds to 127.0.0.1). Any shared environment must use HTTPS (TLS 1.2+).
+tags:
+  - name: Authentication
+    description: Registration, login and the current user.
+  - name: Catalogue
+    description: Public browsing, filtering and searching of books.
+  - name: Cart
+    description: The authenticated user's shopping cart.
+  - name: Addresses
+    description: Delivery address book.
+  - name: Checkout and Payments
+    description: Order creation and simulated payment.
+  - name: Orders
+    description: Order history, tracking, cancellation and buy again.
+  - name: Gift Points
+    description: Gift point balance and the audit ledger.
+  - name: Recommendations
+    description: Book suggestions based on order history.
+security:
+  - bearerAuth: []
+paths:
+  # ------------------------------------------------------------------ Authentication
+  /api/auth/register:
+    post:
+      tags: [Authentication]
+      operationId: registerUser
+      summary: Register a new customer account
+      description: |
+        Creates a `CUSTOMER` account. The password is hashed with BCrypt or Argon2 and is never returned,
+        logged or stored in plain text. Registration does not log the user in; call `POST /api/auth/login` next.
+
+        Trade-off: `409 EMAIL_ALREADY_REGISTERED` reveals that an e-mail address is registered. This is
+        accepted for usability; the endpoint is rate limited (`429`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            examples:
+              newCustomer:
+                $ref: '#/components/examples/RegisterRequestExample'
+      responses:
+        '201':
+          description: Account created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+              examples:
+                created:
+                  $ref: '#/components/examples/UserProfileExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: The e-mail address is already registered (compared ignoring case).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                emailTaken:
+                  $ref: '#/components/examples/EmailAlreadyRegisteredExample'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/auth/login:
+    post:
+      tags: [Authentication]
+      operationId: loginUser
+      summary: Log in and obtain a JWT access token
+      description: |
+        Returns a short-lived signed JWT (`expiresIn` seconds). Wrong e-mail, wrong password and a
+        disabled account all return the same generic `401 INVALID_CREDENTIALS` so that attackers cannot
+        tell them apart. The endpoint is rate limited (`429`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              customer:
+                $ref: '#/components/examples/LoginRequestExample'
+      responses:
+        '200':
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+              examples:
+                loggedIn:
+                  $ref: '#/components/examples/AuthResponseExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Invalid credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidCredentials:
+                  $ref: '#/components/examples/InvalidCredentialsExample'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/users/me:
+    get:
+      tags: [Authentication]
+      operationId: getCurrentUser
+      summary: Get the authenticated user's profile
+      responses:
+        '200':
+          description: The current user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+              examples:
+                profile:
+                  $ref: '#/components/examples/UserProfileExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ------------------------------------------------------------------ Catalogue
+  /api/books:
+    get:
+      tags: [Catalogue]
+      operationId: listBooks
+      summary: Browse books with filtering, sorting and pagination
+      description: |
+        Lists active books. All filters are optional and combine with AND. Inactive (soft-deleted)
+        books are never returned. Use `GET /api/books/search` for keyword search.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CategoryId'
+        - $ref: '#/components/parameters/PublisherId'
+        - $ref: '#/components/parameters/MinPrice'
+        - $ref: '#/components/parameters/MaxPrice'
+        - $ref: '#/components/parameters/InStock'
+        - $ref: '#/components/parameters/MinRating'
+        - $ref: '#/components/parameters/BookSort'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: A page of books (an empty `content` array when nothing matches).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookPage'
+              examples:
+                programmingBooks:
+                  $ref: '#/components/examples/BookPageExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/books/search:
+    get:
+      tags: [Catalogue]
+      operationId: searchBooks
+      summary: Search books by keyword
+      description: |
+        Case-insensitive keyword search over title, author name and ISBN, with the same filters,
+        pagination and error behaviour as `GET /api/books`. Default sort is `relevance`.
+
+        Routing note: `/api/books/search` is a literal path and takes precedence over `/api/books/{id}`;
+        the `id` of a book is always numeric.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/SearchQuery'
+        - $ref: '#/components/parameters/CategoryId'
+        - $ref: '#/components/parameters/PublisherId'
+        - $ref: '#/components/parameters/MinPrice'
+        - $ref: '#/components/parameters/MaxPrice'
+        - $ref: '#/components/parameters/InStock'
+        - $ref: '#/components/parameters/MinRating'
+        - $ref: '#/components/parameters/SearchSort'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: A page of matching books (an empty `content` array when nothing matches).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookPage'
+              examples:
+                searchResult:
+                  $ref: '#/components/examples/BookPageExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/books/{id}:
+    get:
+      tags: [Catalogue]
+      operationId: getBook
+      summary: Get book details
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/BookIdPath'
+      responses:
+        '200':
+          description: The book.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookDetail'
+              examples:
+                cleanCode:
+                  $ref: '#/components/examples/BookDetailExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/BookNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/books/{id}/related:
+    get:
+      tags: [Catalogue]
+      operationId: getRelatedBooks
+      summary: Get books related to a book
+      description: |
+        Active books that share the category, an author, or the publisher with the given book, best
+        match first. The book itself is never included. Returns an empty array when nothing is related.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/BookIdPath'
+        - $ref: '#/components/parameters/RelatedLimit'
+      responses:
+        '200':
+          description: Related books (at most `limit`).
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 12
+                items:
+                  $ref: '#/components/schemas/BookSummary'
+              examples:
+                related:
+                  $ref: '#/components/examples/RelatedBooksExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/BookNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/categories:
+    get:
+      tags: [Catalogue]
+      operationId: listCategories
+      summary: List all categories
+      security: []
+      responses:
+        '200':
+          description: All categories, sorted by name.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Category'
+              examples:
+                categories:
+                  $ref: '#/components/examples/CategoriesExample'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/publishers:
+    get:
+      tags: [Catalogue]
+      operationId: listPublishers
+      summary: List all publishers
+      security: []
+      responses:
+        '200':
+          description: All publishers, sorted by name.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Publisher'
+              examples:
+                publishers:
+                  $ref: '#/components/examples/PublishersExample'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ------------------------------------------------------------------ Cart
+  /api/cart:
+    get:
+      tags: [Cart]
+      operationId: getCart
+      summary: Get the current user's cart
+      description: |
+        Prices are the current catalogue prices (the price snapshot is taken only at checkout). An empty
+        cart is returned as `items: []`, never as `404`. A cart is created lazily on first use.
+      responses:
+        '200':
+          description: The cart.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+              examples:
+                cart:
+                  $ref: '#/components/examples/CartExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/cart/items:
+    post:
+      tags: [Cart]
+      operationId: addCartItem
+      summary: Add a book to the cart
+      description: |
+        If the book is already in the cart the quantities are added together (one line per book).
+        The resulting quantity must be at most 10 and at most the available stock.
+        Returns `201` when a new line was created and `200` when an existing line was increased.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddCartItemRequest'
+            examples:
+              addOne:
+                $ref: '#/components/examples/AddCartItemRequestExample'
+      responses:
+        '200':
+          description: An existing line was increased. The updated cart is returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+              examples:
+                cart:
+                  $ref: '#/components/examples/CartExample'
+        '201':
+          description: A new line was created. The updated cart is returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+              examples:
+                cart:
+                  $ref: '#/components/examples/CartExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/BookNotFound'
+        '409':
+          description: Stock or per-line limit conflict.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                insufficientStock:
+                  $ref: '#/components/examples/InsufficientStockExample'
+                lineLimitExceeded:
+                  $ref: '#/components/examples/CartLineLimitExceededExample'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/cart/items/{itemId}:
+    put:
+      tags: [Cart]
+      operationId: updateCartItem
+      summary: Set the quantity of a cart line
+      description: Sets (does not add to) the quantity. To remove a line use `DELETE`.
+      parameters:
+        - $ref: '#/components/parameters/CartItemIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCartItemRequest'
+            examples:
+              setThree:
+                $ref: '#/components/examples/UpdateCartItemRequestExample'
+      responses:
+        '200':
+          description: The updated cart.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+              examples:
+                cart:
+                  $ref: '#/components/examples/CartExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/CartItemNotFound'
+        '409':
+          description: Requested quantity exceeds the available stock.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                insufficientStock:
+                  $ref: '#/components/examples/InsufficientStockExample'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Cart]
+      operationId: removeCartItem
+      summary: Remove a line from the cart
+      description: Returns the updated cart (not `204`) so the client can refresh totals in one call.
+      parameters:
+        - $ref: '#/components/parameters/CartItemIdPath'
+      responses:
+        '200':
+          description: The updated cart.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+              examples:
+                cart:
+                  $ref: '#/components/examples/CartExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/CartItemNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ------------------------------------------------------------------ Addresses
+  /api/addresses:
+    get:
+      tags: [Addresses]
+      operationId: listAddresses
+      summary: List the user's delivery addresses
+      description: The default address (if any) comes first, then newest first.
+      responses:
+        '200':
+          description: The addresses (empty array if none).
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 10
+                items:
+                  $ref: '#/components/schemas/Address'
+              examples:
+                addresses:
+                  $ref: '#/components/examples/AddressListExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Addresses]
+      operationId: createAddress
+      summary: Add a delivery address
+      description: |
+        The first address a user saves automatically becomes the default. If `isDefault` is true, the
+        previous default is cleared (a user has at most one default). At most 10 addresses per user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressRequest'
+            examples:
+              home:
+                $ref: '#/components/examples/AddressRequestExample'
+      responses:
+        '201':
+          description: Address created.
+          headers:
+            Location:
+              description: URL of the created address.
+              schema:
+                type: string
+                example: /api/addresses/3
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Address'
+              examples:
+                created:
+                  $ref: '#/components/examples/AddressExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The user already has 10 addresses.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                limitReached:
+                  $ref: '#/components/examples/AddressLimitReachedExample'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/addresses/{id}:
+    put:
+      tags: [Addresses]
+      operationId: updateAddress
+      summary: Replace a delivery address
+      description: |
+        Full replacement of all fields. Editing an address never changes existing orders, because each
+        order keeps its own copy of the delivery address.
+      parameters:
+        - $ref: '#/components/parameters/AddressIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressRequest'
+            examples:
+              home:
+                $ref: '#/components/examples/AddressRequestExample'
+      responses:
+        '200':
+          description: The updated address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Address'
+              examples:
+                updated:
+                  $ref: '#/components/examples/AddressExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/AddressNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Addresses]
+      operationId: deleteAddress
+      summary: Delete a delivery address
+      description: |
+        Existing orders are unaffected (they hold a copy). If the default address is deleted, the most
+        recently created remaining address becomes the default.
+      parameters:
+        - $ref: '#/components/parameters/AddressIdPath'
+      responses:
+        '204':
+          description: Address deleted.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/AddressNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ------------------------------------------------------------------ Checkout and payments
+  /api/checkout:
+    post:
+      tags: [Checkout and Payments]
+      operationId: checkout
+      summary: Create an order from the cart (with optional gift-point redemption)
+      description: |
+        Converts the authenticated user's cart into an order in one database transaction.
+
+        **What the client sends:** only the delivery address id, the payment method and, optionally, the
+        number of gift points to redeem. **Totals, prices and statuses are never accepted.**
+
+        **What the server does:**
+        1. Rejects an empty cart (`409 EMPTY_CART`).
+        2. Loads the address, which must belong to the user (`404 ADDRESS_NOT_FOUND`).
+        3. Re-prices every line from the catalogue and checks stock (`409 INSUFFICIENT_STOCK`).
+        4. Validates `pointsToRedeem`: a whole number, at most the user's balance, and at most 50% of the
+           subtotal (`422 INVALID_POINTS_REDEMPTION`). Discount = points x 1.00; `totalAmount = subtotal - pointsDiscount`.
+        5. Creates the order (`PLACED`) with a snapshot of item titles, prices, quantities and the delivery
+           address, plus a payment in `PENDING` state; decrements stock; writes a `REDEEM` gift-point ledger entry; sets the
+           tentative delivery date; clears the cart.
+
+        **Next step.** For `CARD` and `UPI`, call `POST /api/payments/{orderId}/process`. For `COD` no
+        processing call is needed (payment stays `PENDING` until delivery).
+
+        **Idempotency.** `Idempotency-Key` is required. Retrying with the same key and the same body returns the
+        original response (with `Idempotent-Replayed: true`) and never creates a second order.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutRequest'
+            examples:
+              withGiftPoints:
+                $ref: '#/components/examples/CheckoutRequestExample'
+              withoutGiftPoints:
+                $ref: '#/components/examples/CheckoutRequestNoPointsExample'
+      responses:
+        '201':
+          description: Order created. `payment.status` is `PENDING`.
+          headers:
+            Location:
+              description: URL of the created order.
+              schema:
+                type: string
+                example: /api/orders/15
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                placed:
+                  $ref: '#/components/examples/OrderExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/AddressNotFound'
+        '409':
+          description: The request conflicts with the current state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                emptyCart:
+                  $ref: '#/components/examples/EmptyCartExample'
+                insufficientStock:
+                  $ref: '#/components/examples/CheckoutInsufficientStockExample'
+                idempotencyInProgress:
+                  $ref: '#/components/examples/IdempotencyKeyInProgressExample'
+        '422':
+          description: A business rule rejected the request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidPoints:
+                  $ref: '#/components/examples/InvalidPointsRedemptionExample'
+                keyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReusedExample'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/payments/{orderId}/process:
+    post:
+      tags: [Checkout and Payments]
+      operationId: processPayment
+      summary: Process (simulate) the payment of an order
+      description: |
+        Runs the **simulated** gateway for a `CARD` or `UPI` order. The request has no body: the amount
+        and method come from the order, and the outcome (`SUCCESS` or `FAILED`) is decided only by the
+        server. No card number, CVV or UPI PIN is ever collected or stored.
+
+        **Outcomes (both return `200`; always check `status`):**
+        - `SUCCESS`: `paidAt` and `transactionRef` are set; the order stays `PLACED`.
+        - `FAILED`: `failureReason` is set and the order is cancelled automatically (stock restored, redeemed
+          points returned). The user can retry with "buy again" on that order.
+
+        **Idempotency.** `Idempotency-Key` is required and scoped to the user and order. A retry with the same key
+        returns the stored result and never charges twice. A new key on an already settled payment returns
+        `409 PAYMENT_ALREADY_SETTLED`.
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPayPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Payment processed. Check `status`.
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+              examples:
+                success:
+                  $ref: '#/components/examples/PaymentSuccessExample'
+                failed:
+                  $ref: '#/components/examples/PaymentFailedExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '409':
+          description: The payment cannot be processed in the current state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                alreadySettled:
+                  $ref: '#/components/examples/PaymentAlreadySettledExample'
+                orderNotPayable:
+                  $ref: '#/components/examples/OrderNotPayableExample'
+                notRequired:
+                  $ref: '#/components/examples/PaymentNotRequiredExample'
+                idempotencyInProgress:
+                  $ref: '#/components/examples/IdempotencyKeyInProgressExample'
+        '422':
+          description: The idempotency key was already used for a different request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                keyReused:
+                  $ref: '#/components/examples/IdempotencyKeyReusedExample'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/payments/{orderId}:
+    get:
+      tags: [Checkout and Payments]
+      operationId: getPayment
+      summary: Get the payment of an order
+      description: Every order has exactly one payment, created at checkout.
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPayPath'
+      responses:
+        '200':
+          description: The payment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payment'
+              examples:
+                pending:
+                  $ref: '#/components/examples/PaymentPendingExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ------------------------------------------------------------------ Orders
+  /api/orders:
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: List the user's orders (newest first)
+      parameters:
+        - $ref: '#/components/parameters/OrderStatusFilter'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: A page of order summaries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPage'
+              examples:
+                orders:
+                  $ref: '#/components/examples/OrderPageExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/orders/{id}:
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Get an order with items, payment, tracking timeline and cancellation eligibility
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+      responses:
+        '200':
+          description: The order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                placed:
+                  $ref: '#/components/examples/OrderExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/orders/{id}/cancel:
+    post:
+      tags: [Orders]
+      operationId: cancelOrder
+      summary: Cancel an order (within 48 hours, status permitting)
+      description: |
+        **Cancellation rule.** An order can be cancelled only if **both** conditions hold:
+        1. its status is `PLACED`, `CONFIRMED` or `PACKED`, and
+        2. fewer than 48 hours have passed since `createdAt` (the window closes at `createdAt + 48h`;
+           a request at or after that instant is refused).
+
+        `SHIPPED` and `DELIVERED` orders can never be cancelled. The server checks in this order and
+        returns the first failure: already cancelled, then status, then time window. The `cancellation`
+        object on every order tells the UI in advance whether cancelling is allowed.
+
+        **Effects (one transaction):** status becomes `CANCELLED`, `cancelledAt` and `cancelReason` are set,
+        stock is restored, redeemed gift points are returned as a `REFUND` ledger entry, and the payment
+        becomes `REFUNDED` (simulated) if it was `SUCCESS`, or `FAILED` if it was still `PENDING`.
+
+        **Idempotency.** Cancelling is idempotent by state: a second request returns
+        `409 ORDER_ALREADY_CANCELLED` and changes nothing, so no `Idempotency-Key` is needed.
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequest'
+            examples:
+              withReason:
+                $ref: '#/components/examples/CancelOrderRequestExample'
+      responses:
+        '200':
+          description: The cancelled order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                cancelled:
+                  $ref: '#/components/examples/CancelledOrderExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '409':
+          description: The order cannot be cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                alreadyCancelled:
+                  $ref: '#/components/examples/OrderAlreadyCancelledExample'
+                wrongStatus:
+                  $ref: '#/components/examples/OrderNotCancellableStatusExample'
+                windowExpired:
+                  $ref: '#/components/examples/CancellationWindowExpiredExample'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/orders/{id}/buy-again:
+    post:
+      tags: [Orders]
+      operationId: buyAgain
+      summary: Put the books of a previous order back into the cart
+      description: |
+        Works for any of the user's orders, including cancelled ones. For every book in the order, the cart
+        is set to **at least** the ordered quantity, limited to 10 and to the available stock. Because it
+        sets a minimum instead of adding, calling it twice gives the same cart (idempotent by design,
+        no `Idempotency-Key` needed).
+
+        Books that are inactive or out of stock are skipped and listed in `issues` (a book added with a reduced
+        quantity is listed there too). If **no** book could be added, the response is `409 NO_ITEMS_AVAILABLE`.
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+      responses:
+        '200':
+          description: At least one book was added. Inspect `skipped` for the rest.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuyAgainResult'
+              examples:
+                partial:
+                  $ref: '#/components/examples/BuyAgainResultExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '409':
+          description: None of the books in the order can be added.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                nothingAvailable:
+                  $ref: '#/components/examples/NoItemsAvailableExample'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ------------------------------------------------------------------ Gift points
+  /api/gift-points/balance:
+    get:
+      tags: [Gift Points]
+      operationId: getGiftPointBalance
+      summary: Get the gift point balance and the redemption rules
+      responses:
+        '200':
+          description: The balance and the rules the checkout will apply.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GiftPointBalance'
+              examples:
+                balance:
+                  $ref: '#/components/examples/GiftPointBalanceExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/gift-points/transactions:
+    get:
+      tags: [Gift Points]
+      operationId: listGiftPointTransactions
+      summary: List the gift point ledger (newest first)
+      description: |
+        Read-only audit trail. Entries are never edited or deleted. `points` is signed:
+        positive for `EARN`/`REFUND`, negative for `REDEEM`. `balanceAfter` is the running balance.
+      parameters:
+        - $ref: '#/components/parameters/GiftPointTypeFilter'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: A page of ledger entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GiftPointTransactionPage'
+              examples:
+                ledger:
+                  $ref: '#/components/examples/GiftPointTransactionPageExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ------------------------------------------------------------------ Recommendations
+  /api/recommendations:
+    get:
+      tags: [Recommendations]
+      operationId: getRecommendations
+      summary: Recommend books based on previous orders
+      description: |
+        Rule-based, no machine learning. Active, in-stock books from the categories, authors and publishers of
+        the user's previous (non-cancelled) orders, excluding books already bought. Users without
+        qualifying orders get the most popular books instead (`strategy: POPULAR`).
+      parameters:
+        - $ref: '#/components/parameters/RecommendationLimit'
+      responses:
+        '200':
+          description: Recommended books and the strategy that produced them.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecommendationList'
+              examples:
+                fromHistory:
+                  $ref: '#/components/examples/RecommendationListExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT access token from `POST /api/auth/login`, sent as `Authorization: Bearer <token>`.
+        Tokens are signed, short lived, and must be sent over HTTPS outside local development.
+        A missing, malformed, expired or tampered token returns `401 UNAUTHORIZED`.
+
+  # ==================================================================== parameters
+  parameters:
+    Page:
+      name: page
+      in: query
+      description: Zero-based page number.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    Size:
+      name: size
+      in: query
+      description: Page size.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    CategoryId:
+      name: categoryId
+      in: query
+      description: Only books in this category.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 4
+    PublisherId:
+      name: publisherId
+      in: query
+      description: Only books from this publisher.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 6
+    MinPrice:
+      name: minPrice
+      in: query
+      description: Minimum price, inclusive. Must not exceed `maxPrice` when both are given (otherwise `400`).
+      schema:
+        type: number
+        minimum: 0
+        multipleOf: 0.01
+      example: 300.00
+    MaxPrice:
+      name: maxPrice
+      in: query
+      description: Maximum price, inclusive.
+      schema:
+        type: number
+        minimum: 0
+        multipleOf: 0.01
+      example: 1000.00
+    InStock:
+      name: inStock
+      in: query
+      description: When `true`, only books with stock available. When omitted or `false`, in-stock and out-of-stock books are both returned.
+      schema:
+        type: boolean
+    MinRating:
+      name: minRating
+      in: query
+      description: Minimum average rating, inclusive.
+      schema:
+        type: number
+        minimum: 0
+        maximum: 5
+      example: 4.0
+    BookSort:
+      name: sort
+      in: query
+      description: Sort order.
+      schema:
+        type: string
+        enum: [newest, title_asc, title_desc, price_asc, price_desc, rating_desc]
+        default: newest
+    SearchSort:
+      name: sort
+      in: query
+      description: Sort order. `relevance` ranks title matches above author and ISBN matches.
+      schema:
+        type: string
+        enum: [relevance, newest, title_asc, title_desc, price_asc, price_desc, rating_desc]
+        default: relevance
+    SearchQuery:
+      name: q
+      in: query
+      required: true
+      description: Search text, matched case-insensitively against title, author name and ISBN.
+      schema:
+        type: string
+        minLength: 2
+        maxLength: 100
+      example: clean code
+    BookIdPath:
+      name: id
+      in: path
+      required: true
+      description: Book id.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 9
+    RelatedLimit:
+      name: limit
+      in: query
+      description: Maximum number of related books.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 12
+        default: 6
+    CartItemIdPath:
+      name: itemId
+      in: path
+      required: true
+      description: Cart line id (`itemId` in the cart response, not the book id).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 31
+    AddressIdPath:
+      name: id
+      in: path
+      required: true
+      description: Address id.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 3
+    OrderIdPath:
+      name: id
+      in: path
+      required: true
+      description: Order id.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 15
+    OrderIdPayPath:
+      name: orderId
+      in: path
+      required: true
+      description: Order id.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+      example: 15
+    OrderStatusFilter:
+      name: status
+      in: query
+      description: Only orders with this status.
+      schema:
+        $ref: '#/components/schemas/OrderStatus'
+    GiftPointTypeFilter:
+      name: type
+      in: query
+      description: Only ledger entries of this type.
+      schema:
+        $ref: '#/components/schemas/GiftPointTransactionType'
+    RecommendationLimit:
+      name: limit
+      in: query
+      description: Maximum number of recommended books.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 20
+        default: 10
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Unique key chosen by the client for one logical operation (a random UUID v4 is recommended).
+        Generate it once per user action and **reuse the same key when retrying** after a timeout or network error.
+        Keys are scoped to the authenticated user and the operation, and are remembered for 24 hours.
+
+        - Same key, same request: the original response is returned again, with `Idempotent-Replayed: true`.
+        - Same key, still being processed: `409 IDEMPOTENCY_KEY_IN_PROGRESS`; retry after a short delay.
+        - Same key, different request: `422 IDEMPOTENCY_KEY_REUSED`.
+        - Missing or malformed key: `400 VALIDATION_FAILED`.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 64
+        pattern: '^[A-Za-z0-9_-]{16,64}$'
+      example: 7b6c1a52-3f4d-4e0e-9a58-2a4f6d1c8e90
+
+  # ==================================================================== headers
+  headers:
+    IdempotentReplayed:
+      description: Present with value `true` when this response is a replay of an earlier request with the same `Idempotency-Key`.
+      schema:
+        type: string
+        enum: ['true']
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        minimum: 1
+      example: 30
+
+  # ==================================================================== reusable responses
+  responses:
+    BadRequest:
+      description: |
+        The request is invalid: a field failed validation, the JSON is malformed, a parameter has the wrong
+        type, or a required header is missing. `fieldErrors` lists each problem.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            validationFailed:
+              $ref: '#/components/examples/ValidationFailedExample'
+    Unauthorized:
+      description: Authentication is required, or the token is missing, malformed, expired or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unauthorized:
+              $ref: '#/components/examples/UnauthorizedExample'
+    TooManyRequests:
+      description: Too many attempts from this client. Wait for `Retry-After` seconds.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            tooManyRequests:
+              $ref: '#/components/examples/TooManyRequestsExample'
+    InternalServerError:
+      description: Unexpected server error. The body is intentionally generic; details are only in the server logs.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            internalError:
+              $ref: '#/components/examples/InternalErrorExample'
+    BookNotFound:
+      description: No active book with this id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            bookNotFound:
+              $ref: '#/components/examples/BookNotFoundExample'
+    CartItemNotFound:
+      description: The cart line does not exist in the current user's cart.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            cartItemNotFound:
+              $ref: '#/components/examples/CartItemNotFoundExample'
+    AddressNotFound:
+      description: The address does not exist or does not belong to the current user.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            addressNotFound:
+              $ref: '#/components/examples/AddressNotFoundExample'
+    OrderNotFound:
+      description: The order does not exist or does not belong to the current user.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            orderNotFound:
+              $ref: '#/components/examples/OrderNotFoundExample'
+
+  # ==================================================================== schemas
+  # These are API DTOs, not database entities: no password hash, JPA version, soft-delete flag or raw stock counts.
+  schemas:
+    # ---------------------------------------------------------------- shared
+    MoneyAmount:
+      type: number
+      minimum: 0
+      multipleOf: 0.01
+      description: Amount in the store currency with at most 2 decimal places. Stored as a decimal, never a float.
+      example: 899.00
+    OrderStatus:
+      type: string
+      description: |
+        Order lifecycle: `PLACED` -> `CONFIRMED` -> `PACKED` -> `SHIPPED` -> `DELIVERED`, or `CANCELLED`.
+        Only `PLACED`, `CONFIRMED` and `PACKED` orders can be cancelled (and only within 48 hours).
+      enum: [PLACED, CONFIRMED, PACKED, SHIPPED, DELIVERED, CANCELLED]
+    PaymentMethod:
+      type: string
+      description: |
+        `CARD` and `UPI` are processed by the simulated gateway via `POST /api/payments/{orderId}/process`.
+        `COD` (cash on delivery) stays `PENDING` until delivery. Gift points are not a payment method: they are
+        a partial discount (`pointsToRedeem`) that can be combined with any method.
+      enum: [CARD, UPI, COD]
+    PaymentStatus:
+      type: string
+      description: |
+        `PENDING` (created at checkout), `SUCCESS` (simulated charge accepted), `FAILED` (declined, or the order
+        was cancelled before it was paid), `REFUNDED` (paid order cancelled; simulated refund).
+      enum: [PENDING, SUCCESS, FAILED, REFUNDED]
+    GiftPointTransactionType:
+      type: string
+      description: |
+        `EARN` (credited when an order is delivered, positive), `REDEEM` (used at checkout, negative),
+        `REFUND` (points returned when an order is cancelled, positive), `ADJUST` (manual correction by staff).
+      enum: [EARN, REDEEM, REFUND, ADJUST]
+    PageMeta:
+      type: object
+      required: [page, size, totalElements, totalPages, first, last]
+      properties:
+        page:
+          type: integer
+          minimum: 0
+          description: Zero-based page number.
+        size:
+          type: integer
+          minimum: 1
+          maximum: 100
+        totalElements:
+          type: integer
+          format: int64
+          minimum: 0
+        totalPages:
+          type: integer
+          minimum: 0
+        first:
+          type: boolean
+        last:
+          type: boolean
+
+    # ---------------------------------------------------------------- errors
+    FieldError:
+      type: object
+      description: One validation problem. The rejected value is deliberately not echoed (it could be a password).
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: Request field, query parameter or header name.
+          example: quantity
+        message:
+          type: string
+          example: must be between 1 and 10
+    ErrorResponse:
+      type: object
+      description: |
+        Standard error body for every non-2xx response. Switch on `code`, not on `message`; `message` is for humans
+        and never contains stack traces, SQL, class names or other users' data.
+      required: [timestamp, status, error, code, message, path]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-10-15T10:35:00Z"
+        status:
+          type: integer
+          description: HTTP status code.
+          example: 409
+        error:
+          type: string
+          description: HTTP reason phrase.
+          example: Conflict
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          enum:
+            - VALIDATION_FAILED
+            - UNAUTHORIZED
+            - INVALID_CREDENTIALS
+            - EMAIL_ALREADY_REGISTERED
+            - TOO_MANY_REQUESTS
+            - BOOK_NOT_FOUND
+            - CART_ITEM_NOT_FOUND
+            - ADDRESS_NOT_FOUND
+            - ORDER_NOT_FOUND
+            - INSUFFICIENT_STOCK
+            - CART_LINE_LIMIT_EXCEEDED
+            - ADDRESS_LIMIT_REACHED
+            - EMPTY_CART
+            - INVALID_POINTS_REDEMPTION
+            - IDEMPOTENCY_KEY_IN_PROGRESS
+            - IDEMPOTENCY_KEY_REUSED
+            - PAYMENT_ALREADY_SETTLED
+            - ORDER_NOT_PAYABLE
+            - PAYMENT_NOT_REQUIRED
+            - ORDER_ALREADY_CANCELLED
+            - ORDER_NOT_CANCELLABLE_STATUS
+            - CANCELLATION_WINDOW_EXPIRED
+            - NO_ITEMS_AVAILABLE
+            - INTERNAL_ERROR
+          example: INSUFFICIENT_STOCK
+        message:
+          type: string
+          example: Only 2 copies of "Clean Code" are available.
+        path:
+          type: string
+          description: Request path.
+          example: /api/cart/items
+        fieldErrors:
+          type: array
+          description: Present for `VALIDATION_FAILED`.
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    # ---------------------------------------------------------------- authentication
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        There is deliberately no `role` field: every self-registered account is a `CUSTOMER`
+        (unknown fields are rejected, which prevents privilege escalation).
+      required: [fullName, email, password]
+      properties:
+        fullName:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: Asha Rao
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Unique ignoring case. Stored and compared in lower case.
+          example: asha.rao@example.com
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 8
+          maxLength: 72
+          pattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9]).+$'
+          description: 8 to 72 characters with at least one lower-case letter, one upper-case letter and one digit. Never returned or logged.
+          example: Example-Passw0rd-123
+        phone:
+          type: string
+          pattern: '^[0-9+() -]{7,20}$'
+          description: Optional. Digits, spaces and `+ - ( )` only.
+          example: "+91 98765 43210"
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          example: asha.rao@example.com
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 1
+          maxLength: 72
+          example: Example-Passw0rd-123
+    UserProfile:
+      type: object
+      description: Public view of a user. Never contains the password hash.
+      required: [id, fullName, email, phone, role, createdAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 7
+        fullName:
+          type: string
+          example: Asha Rao
+        email:
+          type: string
+          format: email
+          example: asha.rao@example.com
+        phone:
+          type: string
+          nullable: true
+          example: "+91 98765 43210"
+        role:
+          type: string
+          enum: [CUSTOMER, ADMIN]
+          example: CUSTOMER
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-10-01T08:15:00Z"
+    AuthResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn, user]
+      properties:
+        accessToken:
+          type: string
+          description: 'Signed JWT. Send it as `Authorization: Bearer <accessToken>`.'
+        tokenType:
+          type: string
+          enum: [Bearer]
+        expiresIn:
+          type: integer
+          minimum: 1
+          description: Token lifetime in seconds.
+          example: 1800
+        user:
+          $ref: '#/components/schemas/UserProfile'
+
+    # ---------------------------------------------------------------- catalogue
+    Category:
+      type: object
+      required: [id, name, description]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 4
+        name:
+          type: string
+          example: Programming
+        description:
+          type: string
+          nullable: true
+          example: Software development and computer science
+    Publisher:
+      type: object
+      required: [id, name, description]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 6
+        name:
+          type: string
+          example: Pearson
+        description:
+          type: string
+          nullable: true
+          example: Education and technical publisher
+    BookSummary:
+      type: object
+      description: Book as shown in lists, the cart and recommendations.
+      required:
+        - id
+        - title
+        - authors
+        - isbn
+        - price
+        - imageUrl
+        - ratingAvg
+        - ratingCount
+        - inStock
+        - categoryId
+        - categoryName
+        - publisherId
+        - publisherName
+        - publishedYear
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 9
+        title:
+          type: string
+          example: Clean Code
+        authors:
+          type: array
+          items:
+            type: string
+          example: [Robert C. Martin]
+        isbn:
+          type: string
+          pattern: '^[0-9]{13}$'
+          example: "9780000000097"
+        price:
+          $ref: '#/components/schemas/MoneyAmount'
+        imageUrl:
+          type: string
+          nullable: true
+          example: null
+        ratingAvg:
+          type: number
+          minimum: 0
+          maximum: 5
+          example: 4.5
+        ratingCount:
+          type: integer
+          minimum: 0
+          example: 12
+        inStock:
+          type: boolean
+          description: True when at least one copy is available.
+          example: true
+        categoryId:
+          type: integer
+          format: int64
+          example: 4
+        categoryName:
+          type: string
+          example: Programming
+        publisherId:
+          type: integer
+          format: int64
+          example: 6
+        publisherName:
+          type: string
+          example: Pearson
+        publishedYear:
+          type: integer
+          nullable: true
+          example: 2008
+    BookDetail:
+      description: A `BookSummary` plus the description and the maximum quantity the user can order.
+      allOf:
+        - $ref: '#/components/schemas/BookSummary'
+        - type: object
+          required: [description, maxOrderableQuantity]
+          properties:
+            description:
+              type: string
+              nullable: true
+              example: A handbook of agile software craftsmanship.
+            maxOrderableQuantity:
+              type: integer
+              minimum: 0
+              maximum: 10
+              description: The smaller of the available stock and the per-line limit of 10. `0` means out of stock.
+              example: 10
+    BookPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/BookSummary'
+
+    # ---------------------------------------------------------------- cart
+    CartItem:
+      type: object
+      required: [itemId, book, quantity, lineTotal, maxQuantity]
+      properties:
+        itemId:
+          type: integer
+          format: int64
+          description: Cart line id, used by `PUT` and `DELETE /api/cart/items/{itemId}`.
+          example: 31
+        book:
+          $ref: '#/components/schemas/BookSummary'
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 10
+          example: 1
+        lineTotal:
+          $ref: '#/components/schemas/MoneyAmount'
+        maxQuantity:
+          type: integer
+          minimum: 0
+          maximum: 10
+          description: Largest quantity currently allowed for this line (stock and the limit of 10). May be lower than `quantity` if stock dropped.
+          example: 10
+    Cart:
+      type: object
+      description: Computed by the server from current catalogue prices.
+      required: [items, totalQuantity, subtotal]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CartItem'
+        totalQuantity:
+          type: integer
+          minimum: 0
+          description: Total number of copies in the cart.
+          example: 2
+        subtotal:
+          $ref: '#/components/schemas/MoneyAmount'
+    AddCartItemRequest:
+      type: object
+      additionalProperties: false
+      required: [bookId]
+      properties:
+        bookId:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 9
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+          example: 1
+    UpdateCartItemRequest:
+      type: object
+      additionalProperties: false
+      required: [quantity]
+      properties:
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 10
+          example: 3
+
+    # ---------------------------------------------------------------- addresses
+    AddressRequest:
+      type: object
+      additionalProperties: false
+      required: [recipientName, phone, line1, city, state, postalCode]
+      properties:
+        recipientName:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: Asha Rao
+        phone:
+          type: string
+          pattern: '^[0-9+() -]{7,20}$'
+          example: "+91 98765 43210"
+        line1:
+          type: string
+          minLength: 1
+          maxLength: 150
+          example: 12 MG Road
+        line2:
+          type: string
+          nullable: true
+          maxLength: 150
+          example: Flat 4B
+        city:
+          type: string
+          minLength: 1
+          maxLength: 80
+          example: Pune
+        state:
+          type: string
+          minLength: 1
+          maxLength: 80
+          example: Maharashtra
+        postalCode:
+          type: string
+          pattern: '^[A-Za-z0-9 -]{3,12}$'
+          example: "411001"
+        countryCode:
+          type: string
+          pattern: '^[A-Z]{2}$'
+          default: IN
+          description: ISO 3166-1 alpha-2 code.
+          example: IN
+        isDefault:
+          type: boolean
+          default: false
+          description: |
+            `true` makes this the default address and clears the previous default. `false` or omitted never
+            removes the default flag from the current default address; to change the default, mark another address as default.
+    Address:
+      type: object
+      required: [id, recipientName, phone, line1, line2, city, state, postalCode, countryCode, isDefault]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 3
+        recipientName:
+          type: string
+          example: Asha Rao
+        phone:
+          type: string
+          example: "+91 98765 43210"
+        line1:
+          type: string
+          example: 12 MG Road
+        line2:
+          type: string
+          nullable: true
+          example: Flat 4B
+        city:
+          type: string
+          example: Pune
+        state:
+          type: string
+          example: Maharashtra
+        postalCode:
+          type: string
+          example: "411001"
+        countryCode:
+          type: string
+          example: IN
+        isDefault:
+          type: boolean
+          example: true
+
+    # ---------------------------------------------------------------- checkout and orders
+    CheckoutRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        The cart is the source of the items. There are deliberately **no** fields for prices, totals, discounts,
+        payment status or order status: any such field is rejected with `400`.
+      required: [addressId, paymentMethod]
+      properties:
+        addressId:
+          type: integer
+          format: int64
+          minimum: 1
+          description: One of the user's saved addresses. A copy is stored on the order.
+          example: 3
+        paymentMethod:
+          $ref: '#/components/schemas/PaymentMethod'
+        pointsToRedeem:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 0
+          description: |
+            Optional number of gift points to redeem (1 point = 1.00 off). Whole number, at most the user's balance,
+            and at most 50% of the cart subtotal (rounded down). `0` or omitted means no redemption.
+          example: 100
+    OrderItem:
+      type: object
+      description: Snapshot of what was bought, frozen at checkout. Later catalogue changes never affect it.
+      required: [bookId, title, isbn, unitPrice, quantity, lineTotal]
+      properties:
+        bookId:
+          type: integer
+          format: int64
+          example: 9
+        title:
+          type: string
+          example: Clean Code
+        isbn:
+          type: string
+          example: "9780000000097"
+        unitPrice:
+          $ref: '#/components/schemas/MoneyAmount'
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 10
+          example: 1
+        lineTotal:
+          $ref: '#/components/schemas/MoneyAmount'
+    ShippingAddress:
+      type: object
+      description: Copy of the delivery address taken at checkout. Editing or deleting the saved address does not change it.
+      required: [recipientName, phone, line1, line2, city, state, postalCode, countryCode]
+      properties:
+        recipientName:
+          type: string
+          example: Asha Rao
+        phone:
+          type: string
+          example: "+91 98765 43210"
+        line1:
+          type: string
+          example: 12 MG Road
+        line2:
+          type: string
+          nullable: true
+          example: Flat 4B
+        city:
+          type: string
+          example: Pune
+        state:
+          type: string
+          example: Maharashtra
+        postalCode:
+          type: string
+          example: "411001"
+        countryCode:
+          type: string
+          example: IN
+    OrderStatusEvent:
+      type: object
+      required: [status, note, changedAt]
+      properties:
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        note:
+          type: string
+          nullable: true
+          example: null
+        changedAt:
+          type: string
+          format: date-time
+          example: "2026-10-15T10:30:00Z"
+    CancellationInfo:
+      type: object
+      description: |
+        Tells the UI whether cancelling is allowed right now. Rule: status is `PLACED`, `CONFIRMED` or `PACKED`
+        **and** the current time is before `cancellableUntil` (`createdAt` + 48 hours).
+      required: [cancellable, cancellableUntil, reason]
+      properties:
+        cancellable:
+          type: boolean
+          example: true
+        cancellableUntil:
+          type: string
+          format: date-time
+          description: End of the 48-hour window (exclusive). Always `createdAt` + 48 hours, whatever the status.
+          example: "2026-10-17T10:30:00Z"
+        reason:
+          type: string
+          nullable: true
+          description: |
+            Why cancelling is not possible; `null` when `cancellable` is true. Checked in this order. The values
+            are the same codes that `POST /api/orders/{id}/cancel` returns as `409` errors.
+          enum: [ORDER_ALREADY_CANCELLED, ORDER_NOT_CANCELLABLE_STATUS, CANCELLATION_WINDOW_EXPIRED, null]
+          example: null
+    Payment:
+      type: object
+      description: No card, CVV or UPI PIN data exists anywhere in this API.
+      required: [orderId, method, status, amount, transactionRef, failureReason, paidAt, refundedAt, createdAt]
+      properties:
+        orderId:
+          type: integer
+          format: int64
+          example: 15
+        method:
+          $ref: '#/components/schemas/PaymentMethod'
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        amount:
+          $ref: '#/components/schemas/MoneyAmount'
+        transactionRef:
+          type: string
+          nullable: true
+          description: Reference from the simulated gateway.
+          example: SIM-8F3A2C91D4B7
+        failureReason:
+          type: string
+          nullable: true
+          example: null
+        paidAt:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        refundedAt:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-10-15T10:30:00Z"
+    Order:
+      type: object
+      description: Full order view. Every value is computed or stored by the server.
+      required:
+        - id
+        - orderNumber
+        - status
+        - createdAt
+        - expectedDeliveryDate
+        - deliveredAt
+        - cancelledAt
+        - cancelReason
+        - shippingAddress
+        - items
+        - subtotal
+        - pointsRedeemed
+        - pointsDiscount
+        - totalAmount
+        - pointsEarned
+        - payment
+        - statusHistory
+        - cancellation
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 15
+        orderNumber:
+          type: string
+          description: Customer-facing unique number.
+          example: EB-20261015-0015
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        createdAt:
+          type: string
+          format: date-time
+          description: Order creation time; the 48-hour cancellation window starts here.
+          example: "2026-10-15T10:30:00Z"
+        expectedDeliveryDate:
+          type: string
+          format: date
+          description: Tentative delivery date (order date + 5 days, +2 for remote postal codes).
+          example: "2026-10-20"
+        deliveredAt:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        cancelledAt:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        cancelReason:
+          type: string
+          nullable: true
+          example: null
+        shippingAddress:
+          $ref: '#/components/schemas/ShippingAddress'
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        subtotal:
+          $ref: '#/components/schemas/MoneyAmount'
+        pointsRedeemed:
+          type: integer
+          minimum: 0
+          example: 100
+        pointsDiscount:
+          $ref: '#/components/schemas/MoneyAmount'
+        totalAmount:
+          description: Always `subtotal - pointsDiscount`; this is the amount to pay.
+          allOf:
+            - $ref: '#/components/schemas/MoneyAmount'
+        pointsEarned:
+          type: integer
+          minimum: 0
+          description: Points that are (or, once delivered, were) credited for this order. Credited only on `DELIVERED`.
+          example: 179
+        payment:
+          $ref: '#/components/schemas/Payment'
+        statusHistory:
+          type: array
+          description: Tracking timeline, oldest first.
+          items:
+            $ref: '#/components/schemas/OrderStatusEvent'
+        cancellation:
+          $ref: '#/components/schemas/CancellationInfo'
+    OrderSummary:
+      type: object
+      required: [id, orderNumber, status, createdAt, expectedDeliveryDate, totalAmount, itemCount, paymentMethod, paymentStatus]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 15
+        orderNumber:
+          type: string
+          example: EB-20261015-0015
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-10-15T10:30:00Z"
+        expectedDeliveryDate:
+          type: string
+          format: date
+          example: "2026-10-20"
+        totalAmount:
+          $ref: '#/components/schemas/MoneyAmount'
+        itemCount:
+          type: integer
+          minimum: 1
+          description: Total number of copies in the order.
+          example: 2
+        paymentMethod:
+          $ref: '#/components/schemas/PaymentMethod'
+        paymentStatus:
+          $ref: '#/components/schemas/PaymentStatus'
+    OrderPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/OrderSummary'
+    CancelOrderRequest:
+      type: object
+      additionalProperties: false
+      description: The whole body is optional.
+      properties:
+        reason:
+          type: string
+          maxLength: 255
+          description: Free text stored on the order. Defaults to "Cancelled by customer".
+          example: Ordered by mistake
+    BuyAgainIssue:
+      type: object
+      description: A book from the old order that was not (fully) added to the cart.
+      required: [bookId, title, reason, requestedQuantity, addedQuantity]
+      properties:
+        bookId:
+          type: integer
+          format: int64
+          example: 10
+        title:
+          type: string
+          example: Effective Java
+        reason:
+          type: string
+          description: '`BOOK_INACTIVE` or `OUT_OF_STOCK`: nothing added. `QUANTITY_REDUCED`: fewer copies added than ordered.'
+          enum: [BOOK_INACTIVE, OUT_OF_STOCK, QUANTITY_REDUCED]
+          example: OUT_OF_STOCK
+        requestedQuantity:
+          type: integer
+          minimum: 1
+          example: 1
+        addedQuantity:
+          type: integer
+          minimum: 0
+          example: 0
+    BuyAgainResult:
+      type: object
+      required: [cart, issues]
+      properties:
+        cart:
+          $ref: '#/components/schemas/Cart'
+        issues:
+          type: array
+          description: Empty when everything was added.
+          items:
+            $ref: '#/components/schemas/BuyAgainIssue'
+
+    # ---------------------------------------------------------------- gift points
+    GiftPointBalance:
+      type: object
+      required: [balance, pointValue, maxRedeemPercentOfSubtotal, earnAmountPerPoint]
+      properties:
+        balance:
+          type: integer
+          minimum: 0
+          description: Points available to redeem now.
+          example: 250
+        pointValue:
+          $ref: '#/components/schemas/MoneyAmount'
+        maxRedeemPercentOfSubtotal:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Highest share of an order's subtotal that points may pay for.
+          example: 50
+        earnAmountPerPoint:
+          $ref: '#/components/schemas/MoneyAmount'
+    GiftPointTransaction:
+      type: object
+      description: One immutable ledger entry.
+      required: [id, type, points, balanceAfter, orderId, description, createdAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 3
+        type:
+          $ref: '#/components/schemas/GiftPointTransactionType'
+        points:
+          type: integer
+          description: Signed, never 0. Positive for `EARN`/`REFUND`, negative for `REDEEM`.
+          example: -100
+        balanceAfter:
+          type: integer
+          minimum: 0
+          description: Running balance after this entry.
+          example: 250
+        orderId:
+          type: integer
+          format: int64
+          nullable: true
+          example: 15
+        description:
+          type: string
+          nullable: true
+          example: Redeemed at checkout
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-10-15T10:30:00Z"
+    GiftPointTransactionPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: array
+              items:
+                $ref: '#/components/schemas/GiftPointTransaction'
+
+    # ---------------------------------------------------------------- recommendations
+    RecommendationList:
+      type: object
+      required: [strategy, books]
+      properties:
+        strategy:
+          type: string
+          description: '`PURCHASE_HISTORY`: based on previous orders. `POPULAR`: fallback for users without qualifying orders.'
+          enum: [PURCHASE_HISTORY, POPULAR]
+          example: PURCHASE_HISTORY
+        books:
+          type: array
+          items:
+            $ref: '#/components/schemas/BookSummary'
+
+  # ==================================================================== examples
+  examples:
+    # ---------------------------------------------------------------- requests
+    RegisterRequestExample:
+      summary: New customer
+      value:
+        fullName: Asha Rao
+        email: asha.rao@example.com
+        password: Example-Passw0rd-123
+        phone: "+91 98765 43210"
+    LoginRequestExample:
+      summary: Customer login
+      value:
+        email: asha.rao@example.com
+        password: Example-Passw0rd-123
+    AddCartItemRequestExample:
+      summary: Add one copy of book 9
+      value:
+        bookId: 9
+        quantity: 1
+    UpdateCartItemRequestExample:
+      summary: Set quantity to 3
+      value:
+        quantity: 3
+    AddressRequestExample:
+      summary: Home address
+      value:
+        recipientName: Asha Rao
+        phone: "+91 98765 43210"
+        line1: 12 MG Road
+        line2: Flat 4B
+        city: Pune
+        state: Maharashtra
+        postalCode: "411001"
+        countryCode: IN
+        isDefault: true
+    CheckoutRequestExample:
+      summary: UPI payment, redeeming 100 gift points
+      value:
+        addressId: 3
+        paymentMethod: UPI
+        pointsToRedeem: 100
+    CheckoutRequestNoPointsExample:
+      summary: Cash on delivery, no gift points
+      value:
+        addressId: 3
+        paymentMethod: COD
+    CancelOrderRequestExample:
+      summary: Cancel with a reason
+      value:
+        reason: Ordered by mistake
+
+    # ---------------------------------------------------------------- authentication
+    UserProfileExample:
+      summary: A customer profile
+      value:
+        id: 7
+        fullName: Asha Rao
+        email: asha.rao@example.com
+        phone: "+91 98765 43210"
+        role: CUSTOMER
+        createdAt: "2026-10-01T08:15:00Z"
+    AuthResponseExample:
+      summary: Successful login
+      value:
+        accessToken: eyJhbGciOiJIUzI1NiJ9.EXAMPLE-PAYLOAD.EXAMPLE-SIGNATURE
+        tokenType: Bearer
+        expiresIn: 1800
+        user:
+          id: 7
+          fullName: Asha Rao
+          email: asha.rao@example.com
+          phone: "+91 98765 43210"
+          role: CUSTOMER
+          createdAt: "2026-10-01T08:15:00Z"
+
+    # ---------------------------------------------------------------- catalogue
+    BookPageExample:
+      summary: Page of programming books
+      value:
+        page: 0
+        size: 20
+        totalElements: 2
+        totalPages: 1
+        first: true
+        last: true
+        content:
+          - id: 9
+            title: Clean Code
+            authors: [Robert C. Martin]
+            isbn: "9780000000097"
+            price: 899.00
+            imageUrl: null
+            ratingAvg: 4.5
+            ratingCount: 12
+            inStock: true
+            categoryId: 4
+            categoryName: Programming
+            publisherId: 6
+            publisherName: Pearson
+            publishedYear: 2008
+          - id: 10
+            title: Effective Java
+            authors: [Joshua Bloch]
+            isbn: "9780000000103"
+            price: 999.00
+            imageUrl: null
+            ratingAvg: 4.8
+            ratingCount: 9
+            inStock: true
+            categoryId: 4
+            categoryName: Programming
+            publisherId: 6
+            publisherName: Pearson
+            publishedYear: 2018
+    BookDetailExample:
+      summary: Book detail
+      value:
+        id: 9
+        title: Clean Code
+        authors: [Robert C. Martin]
+        isbn: "9780000000097"
+        price: 899.00
+        imageUrl: null
+        ratingAvg: 4.5
+        ratingCount: 12
+        inStock: true
+        categoryId: 4
+        categoryName: Programming
+        publisherId: 6
+        publisherName: Pearson
+        publishedYear: 2008
+        description: A handbook of agile software craftsmanship.
+        maxOrderableQuantity: 10
+    RelatedBooksExample:
+      summary: Books related to Clean Code
+      value:
+        - id: 11
+          title: The Pragmatic Programmer
+          authors: [Andrew Hunt, David Thomas]
+          isbn: "9780000000110"
+          price: 949.00
+          imageUrl: null
+          ratingAvg: 4.7
+          ratingCount: 8
+          inStock: true
+          categoryId: 4
+          categoryName: Programming
+          publisherId: 6
+          publisherName: Pearson
+          publishedYear: 2019
+    CategoriesExample:
+      summary: Categories
+      value:
+        - id: 4
+          name: Programming
+          description: Software development and computer science
+        - id: 1
+          name: Fiction
+          description: Novels and short stories
+    PublishersExample:
+      summary: Publishers
+      value:
+        - id: 6
+          name: Pearson
+          description: Education and technical publisher
+        - id: 7
+          name: O'Reilly Media
+          description: Technology publisher
+
+    # ---------------------------------------------------------------- cart
+    CartExample:
+      summary: A cart with two lines
+      value:
+        items:
+          - itemId: 31
+            book:
+              id: 9
+              title: Clean Code
+              authors: [Robert C. Martin]
+              isbn: "9780000000097"
+              price: 899.00
+              imageUrl: null
+              ratingAvg: 4.5
+              ratingCount: 12
+              inStock: true
+              categoryId: 4
+              categoryName: Programming
+              publisherId: 6
+              publisherName: Pearson
+              publishedYear: 2008
+            quantity: 1
+            lineTotal: 899.00
+            maxQuantity: 10
+          - itemId: 32
+            book:
+              id: 11
+              title: The Pragmatic Programmer
+              authors: [Andrew Hunt, David Thomas]
+              isbn: "9780000000110"
+              price: 949.00
+              imageUrl: null
+              ratingAvg: 4.7
+              ratingCount: 8
+              inStock: true
+              categoryId: 4
+              categoryName: Programming
+              publisherId: 6
+              publisherName: Pearson
+              publishedYear: 2019
+            quantity: 1
+            lineTotal: 949.00
+            maxQuantity: 10
+        totalQuantity: 2
+        subtotal: 1848.00
+
+    # ---------------------------------------------------------------- addresses
+    AddressExample:
+      summary: A saved address
+      value:
+        id: 3
+        recipientName: Asha Rao
+        phone: "+91 98765 43210"
+        line1: 12 MG Road
+        line2: Flat 4B
+        city: Pune
+        state: Maharashtra
+        postalCode: "411001"
+        countryCode: IN
+        isDefault: true
+    AddressListExample:
+      summary: Address book
+      value:
+        - id: 3
+          recipientName: Asha Rao
+          phone: "+91 98765 43210"
+          line1: 12 MG Road
+          line2: Flat 4B
+          city: Pune
+          state: Maharashtra
+          postalCode: "411001"
+          countryCode: IN
+          isDefault: true
+        - id: 2
+          recipientName: Asha Rao
+          phone: "+91 98765 43210"
+          line1: 5 Park Street
+          line2: null
+          city: Mumbai
+          state: Maharashtra
+          postalCode: "400001"
+          countryCode: IN
+          isDefault: false
+
+    # ---------------------------------------------------------------- orders and payments
+    OrderExample:
+      summary: Newly placed order (UPI, 100 points redeemed)
+      value:
+        id: 15
+        orderNumber: EB-20261015-0015
+        status: PLACED
+        createdAt: "2026-10-15T10:30:00Z"
+        expectedDeliveryDate: "2026-10-20"
+        deliveredAt: null
+        cancelledAt: null
+        cancelReason: null
+        shippingAddress:
+          recipientName: Asha Rao
+          phone: "+91 98765 43210"
+          line1: 12 MG Road
+          line2: Flat 4B
+          city: Pune
+          state: Maharashtra
+          postalCode: "411001"
+          countryCode: IN
+        items:
+          - bookId: 12
+            title: Designing Data-Intensive Applications
+            isbn: "9780000000127"
+            unitPrice: 1199.00
+            quantity: 1
+            lineTotal: 1199.00
+        subtotal: 1199.00
+        pointsRedeemed: 100
+        pointsDiscount: 100.00
+        totalAmount: 1099.00
+        pointsEarned: 109
+        payment:
+          orderId: 15
+          method: UPI
+          status: PENDING
+          amount: 1099.00
+          transactionRef: null
+          failureReason: null
+          paidAt: null
+          refundedAt: null
+          createdAt: "2026-10-15T10:30:00Z"
+        statusHistory:
+          - status: PLACED
+            note: null
+            changedAt: "2026-10-15T10:30:00Z"
+        cancellation:
+          cancellable: true
+          cancellableUntil: "2026-10-17T10:30:00Z"
+          reason: null
+    CancelledOrderExample:
+      summary: Cancelled order with refunded payment
+      value:
+        id: 15
+        orderNumber: EB-20261015-0015
+        status: CANCELLED
+        createdAt: "2026-10-15T10:30:00Z"
+        expectedDeliveryDate: "2026-10-20"
+        deliveredAt: null
+        cancelledAt: "2026-10-15T14:00:00Z"
+        cancelReason: Ordered by mistake
+        shippingAddress:
+          recipientName: Asha Rao
+          phone: "+91 98765 43210"
+          line1: 12 MG Road
+          line2: Flat 4B
+          city: Pune
+          state: Maharashtra
+          postalCode: "411001"
+          countryCode: IN
+        items:
+          - bookId: 12
+            title: Designing Data-Intensive Applications
+            isbn: "9780000000127"
+            unitPrice: 1199.00
+            quantity: 1
+            lineTotal: 1199.00
+        subtotal: 1199.00
+        pointsRedeemed: 100
+        pointsDiscount: 100.00
+        totalAmount: 1099.00
+        pointsEarned: 109
+        payment:
+          orderId: 15
+          method: UPI
+          status: REFUNDED
+          amount: 1099.00
+          transactionRef: SIM-8F3A2C91D4B7
+          failureReason: null
+          paidAt: "2026-10-15T10:31:00Z"
+          refundedAt: "2026-10-15T14:00:00Z"
+          createdAt: "2026-10-15T10:30:00Z"
+        statusHistory:
+          - status: PLACED
+            note: null
+            changedAt: "2026-10-15T10:30:00Z"
+          - status: CANCELLED
+            note: Ordered by mistake
+            changedAt: "2026-10-15T14:00:00Z"
+        cancellation:
+          cancellable: false
+          cancellableUntil: "2026-10-17T10:30:00Z"
+          reason: ORDER_ALREADY_CANCELLED
+    OrderPageExample:
+      summary: Order history
+      value:
+        page: 0
+        size: 20
+        totalElements: 1
+        totalPages: 1
+        first: true
+        last: true
+        content:
+          - id: 15
+            orderNumber: EB-20261015-0015
+            status: PLACED
+            createdAt: "2026-10-15T10:30:00Z"
+            expectedDeliveryDate: "2026-10-20"
+            totalAmount: 1099.00
+            itemCount: 1
+            paymentMethod: UPI
+            paymentStatus: PENDING
+    PaymentPendingExample:
+      summary: Payment waiting to be processed
+      value:
+        orderId: 15
+        method: UPI
+        status: PENDING
+        amount: 1099.00
+        transactionRef: null
+        failureReason: null
+        paidAt: null
+        refundedAt: null
+        createdAt: "2026-10-15T10:30:00Z"
+    PaymentSuccessExample:
+      summary: Simulated payment accepted
+      value:
+        orderId: 15
+        method: UPI
+        status: SUCCESS
+        amount: 1099.00
+        transactionRef: SIM-8F3A2C91D4B7
+        failureReason: null
+        paidAt: "2026-10-15T10:31:00Z"
+        refundedAt: null
+        createdAt: "2026-10-15T10:30:00Z"
+    PaymentFailedExample:
+      summary: Simulated payment declined (order is auto-cancelled)
+      value:
+        orderId: 15
+        method: UPI
+        status: FAILED
+        amount: 1099.00
+        transactionRef: null
+        failureReason: Payment declined by the simulated gateway
+        paidAt: null
+        refundedAt: null
+        createdAt: "2026-10-15T10:30:00Z"
+    BuyAgainResultExample:
+      summary: One book added, one out of stock
+      value:
+        cart:
+          items:
+            - itemId: 33
+              book:
+                id: 9
+                title: Clean Code
+                authors: [Robert C. Martin]
+                isbn: "9780000000097"
+                price: 899.00
+                imageUrl: null
+                ratingAvg: 4.5
+                ratingCount: 12
+                inStock: true
+                categoryId: 4
+                categoryName: Programming
+                publisherId: 6
+                publisherName: Pearson
+                publishedYear: 2008
+              quantity: 1
+              lineTotal: 899.00
+              maxQuantity: 10
+          totalQuantity: 1
+          subtotal: 899.00
+        issues:
+          - bookId: 10
+            title: Effective Java
+            reason: OUT_OF_STOCK
+            requestedQuantity: 1
+            addedQuantity: 0
+
+    # ---------------------------------------------------------------- gift points
+    GiftPointBalanceExample:
+      summary: Balance and rules
+      value:
+        balance: 250
+        pointValue: 1.00
+        maxRedeemPercentOfSubtotal: 50
+        earnAmountPerPoint: 10.00
+    GiftPointTransactionPageExample:
+      summary: Ledger, newest first
+      value:
+        page: 0
+        size: 20
+        totalElements: 2
+        totalPages: 1
+        first: true
+        last: true
+        content:
+          - id: 3
+            type: REDEEM
+            points: -100
+            balanceAfter: 250
+            orderId: 15
+            description: Redeemed at checkout
+            createdAt: "2026-10-15T10:30:00Z"
+          - id: 2
+            type: EARN
+            points: 120
+            balanceAfter: 350
+            orderId: 9
+            description: Earned on delivery
+            createdAt: "2026-10-10T09:00:00Z"
+    RecommendationListExample:
+      summary: Recommendations from purchase history
+      value:
+        strategy: PURCHASE_HISTORY
+        books:
+          - id: 10
+            title: Effective Java
+            authors: [Joshua Bloch]
+            isbn: "9780000000103"
+            price: 999.00
+            imageUrl: null
+            ratingAvg: 4.8
+            ratingCount: 9
+            inStock: true
+            categoryId: 4
+            categoryName: Programming
+            publisherId: 6
+            publisherName: Pearson
+            publishedYear: 2018
+
+    # ---------------------------------------------------------------- errors
+    ValidationFailedExample:
+      summary: Field validation failed
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 400
+        error: Bad Request
+        code: VALIDATION_FAILED
+        message: Request validation failed.
+        path: /api/cart/items
+        fieldErrors:
+          - field: quantity
+            message: must be between 1 and 10
+    UnauthorizedExample:
+      summary: Missing or invalid token
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 401
+        error: Unauthorized
+        code: UNAUTHORIZED
+        message: Authentication is required.
+        path: /api/cart
+    InvalidCredentialsExample:
+      summary: Wrong e-mail or password
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 401
+        error: Unauthorized
+        code: INVALID_CREDENTIALS
+        message: Invalid e-mail or password.
+        path: /api/auth/login
+    EmailAlreadyRegisteredExample:
+      summary: Duplicate e-mail
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: EMAIL_ALREADY_REGISTERED
+        message: This e-mail address is already registered.
+        path: /api/auth/register
+    TooManyRequestsExample:
+      summary: Rate limit hit
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 429
+        error: Too Many Requests
+        code: TOO_MANY_REQUESTS
+        message: Too many attempts. Try again later.
+        path: /api/auth/login
+    InternalErrorExample:
+      summary: Unexpected failure
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 500
+        error: Internal Server Error
+        code: INTERNAL_ERROR
+        message: An unexpected error occurred.
+        path: /api/orders
+    BookNotFoundExample:
+      summary: Unknown book
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 404
+        error: Not Found
+        code: BOOK_NOT_FOUND
+        message: Book not found.
+        path: /api/books/9999
+    CartItemNotFoundExample:
+      summary: Unknown cart line
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 404
+        error: Not Found
+        code: CART_ITEM_NOT_FOUND
+        message: Cart item not found.
+        path: /api/cart/items/999
+    AddressNotFoundExample:
+      summary: Unknown address
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 404
+        error: Not Found
+        code: ADDRESS_NOT_FOUND
+        message: Address not found.
+        path: /api/addresses/999
+    OrderNotFoundExample:
+      summary: Unknown order
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 404
+        error: Not Found
+        code: ORDER_NOT_FOUND
+        message: Order not found.
+        path: /api/orders/999
+    InsufficientStockExample:
+      summary: Not enough copies
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: INSUFFICIENT_STOCK
+        message: Only 2 copies of "Clean Code" are available.
+        path: /api/cart/items
+    CartLineLimitExceededExample:
+      summary: More than 10 copies of one book
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: CART_LINE_LIMIT_EXCEEDED
+        message: You can order at most 10 copies of one book.
+        path: /api/cart/items
+    AddressLimitReachedExample:
+      summary: Address book is full
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: ADDRESS_LIMIT_REACHED
+        message: You can save at most 10 addresses.
+        path: /api/addresses
+    EmptyCartExample:
+      summary: Checkout with an empty cart
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: EMPTY_CART
+        message: Your cart is empty.
+        path: /api/checkout
+    CheckoutInsufficientStockExample:
+      summary: Stock changed since the book was added to the cart
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: INSUFFICIENT_STOCK
+        message: Only 1 copy of "Effective Java" is available. Update your cart and try again.
+        path: /api/checkout
+    InvalidPointsRedemptionExample:
+      summary: Redeeming more than allowed
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 422
+        error: Unprocessable Entity
+        code: INVALID_POINTS_REDEMPTION
+        message: You can redeem at most 599 points for this order.
+        path: /api/checkout
+    IdempotencyKeyInProgressExample:
+      summary: The first request with this key is still running
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: IDEMPOTENCY_KEY_IN_PROGRESS
+        message: A request with this Idempotency-Key is still being processed. Retry shortly.
+        path: /api/checkout
+    IdempotencyKeyReusedExample:
+      summary: Same key, different request
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 422
+        error: Unprocessable Entity
+        code: IDEMPOTENCY_KEY_REUSED
+        message: This Idempotency-Key was already used for a different request.
+        path: /api/checkout
+    PaymentAlreadySettledExample:
+      summary: Payment already processed
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: PAYMENT_ALREADY_SETTLED
+        message: This payment has already been processed.
+        path: /api/payments/15/process
+    OrderNotPayableExample:
+      summary: Order is cancelled
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: ORDER_NOT_PAYABLE
+        message: A cancelled order cannot be paid.
+        path: /api/payments/15/process
+    PaymentNotRequiredExample:
+      summary: Cash on delivery order
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: PAYMENT_NOT_REQUIRED
+        message: Cash on delivery orders are paid on delivery.
+        path: /api/payments/15/process
+    OrderAlreadyCancelledExample:
+      summary: Cancelling twice
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: ORDER_ALREADY_CANCELLED
+        message: This order is already cancelled.
+        path: /api/orders/15/cancel
+    OrderNotCancellableStatusExample:
+      summary: Order already shipped
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: ORDER_NOT_CANCELLABLE_STATUS
+        message: Orders that are SHIPPED or DELIVERED cannot be cancelled.
+        path: /api/orders/15/cancel
+    CancellationWindowExpiredExample:
+      summary: More than 48 hours after ordering
+      value:
+        timestamp: "2026-10-18T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: CANCELLATION_WINDOW_EXPIRED
+        message: Orders can only be cancelled within 48 hours of being placed.
+        path: /api/orders/15/cancel
+    NoItemsAvailableExample:
+      summary: Nothing can be added
+      value:
+        timestamp: "2026-10-15T10:35:00Z"
+        status: 409
+        error: Conflict
+        code: NO_ITEMS_AVAILABLE
+        message: None of the books in this order are currently available.
+        path: /api/orders/15/buy-again
