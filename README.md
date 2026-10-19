@@ -4,12 +4,15 @@ E-commerce bookstore: browse, search, buy and manage book orders.
 Stack: Java 21, Spring Boot 4.1 + Maven + PostgreSQL (backend), React + Vite (frontend), OpenAPI 3 / Swagger UI, JUnit 5 + Mockito.
 
 - Plan: [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)
+- Frontend integration, token strategy and missing backend endpoints: [docs/FRONTEND_INTEGRATION.md](docs/FRONTEND_INTEGRATION.md)
+- Wireframe requirements mapped to pages and endpoints: [docs/WIREFRAME_TRACEABILITY.md](docs/WIREFRAME_TRACEABILITY.md)
 - Database design: [docs/DATABASE_DESIGN.md](docs/DATABASE_DESIGN.md)
 - Authentication and authorization (samples, Swagger UI steps): [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md)
 - API contract: [backend/src/main/resources/openapi.yaml](backend/src/main/resources/openapi.yaml)
 
-Current status: backend scaffold, database migrations and **authentication** (register, login with JWT,
-`GET /api/users/me`) are done. Catalogue, cart, orders and the other features are added next.
+Current status: the backend API (authentication, catalogue, cart, addresses, checkout, payments, gift points,
+orders, recommendations) and the React frontend that uses it are implemented. Admin features are not yet
+(see [docs/FRONTEND_INTEGRATION.md](docs/FRONTEND_INTEGRATION.md)).
 
 ## Prerequisites
 - Java 21 (set `JAVA_HOME` to the JDK 21 folder)
@@ -51,14 +54,19 @@ cd frontend
 npm install
 npm run dev
 ```
-Open http://localhost:5173. The home page shows the backend status.
+Open http://localhost:5173. The backend must be running. The API address comes from `VITE_API_BASE_URL`
+(see [frontend/.env.example](frontend/.env.example)); it defaults to `http://localhost:8080/api`.
 
 ## 4. Run the tests
 ```powershell
 cd backend
 mvn test
+
+cd ../frontend
+npm test
 ```
-Tests start an embedded PostgreSQL automatically, so no database setup is needed for them.
+Backend tests start an embedded PostgreSQL automatically, so no database setup is needed for them.
+Frontend tests run against a fake `fetch` and need no backend.
 
 ## Backend packages (`com.example.ebookstore`)
 | Package | Responsibility |

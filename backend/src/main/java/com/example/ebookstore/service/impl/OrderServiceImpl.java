@@ -9,6 +9,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -47,6 +49,7 @@ import com.example.ebookstore.service.OrderService;
 @Service
 public class OrderServiceImpl implements OrderService {
 
+    private static final Logger log = LoggerFactory.getLogger(OrderServiceImpl.class);
     static final int LOCK_TIMEOUT_MILLIS = 5_000;
 
     private final UserRepository userRepository;
@@ -144,8 +147,10 @@ public class OrderServiceImpl implements OrderService {
                     paymentGateway.refundPayment(new com.example.ebookstore.service.payment.PaymentGatewayRefundRequest(
                             order.getId(), payment.getTransactionRef(), payment.getAmount()));
             if (!refundResult.success()) {
-                throw new ApiException(ErrorCode.INTERNAL_ERROR,
-                        "Refund processing failed: " + refundResult.failureReason());
+                // Log the gateway detail server-side only; never send gateway internals to the client.
+                log.error("Refund failed for order {} (gateway: {})", order.getOrderNumber(),
+                        refundResult.failureReason());
+                throw new ApiException(ErrorCode.INTERNAL_ERROR);
             }
             payment.markRefunded(now);
         } else if (payment.getStatus() == PaymentStatus.PENDING) {

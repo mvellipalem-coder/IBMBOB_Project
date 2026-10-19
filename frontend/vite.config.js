@@ -7,4 +7,10 @@ export default defineConfig({
     host: '127.0.0.1', // bind to localhost only
     port: 5173,
   },
+  test: {
+    environment: 'jsdom',
+    setupFiles: './src/test/setup.js',
+    css: false,
+    restoreMocks: true,
+  },
 });

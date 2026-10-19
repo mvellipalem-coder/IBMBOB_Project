@@ -11,7 +11,9 @@ info:
     **Authentication.** Protected operations need `Authorization: Bearer <JWT>`, obtained from
     `POST /api/auth/login`. Public operations (registration, login and the whole catalogue) are marked
     with an empty `security` list. All protected operations are available to any authenticated
-    user (`CUSTOMER` or `ADMIN`); no operation in this document needs a role check, so there is no `403`.
+    user (`CUSTOMER` or `ADMIN`); no operation documented here needs a role check beyond authentication,
+    so a `403` will not appear in normal customer flows. (Catalogue write paths are ADMIN-only and are
+    not yet documented because they are not yet implemented.)
 
     **Ownership.** Carts, addresses, orders, payments and gift points always belong to the
     authenticated user, taken from the token and never from the request. A resource that belongs to
