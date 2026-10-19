@@ -1,4 +1,4 @@
-﻿# EBookStore - Database Design (PostgreSQL)
+# EBookStore - Database Design (PostgreSQL)
 
 Source of truth: Flyway migrations in `backend/src/main/resources/db/migration/`
 
@@ -6,6 +6,7 @@ Source of truth: Flyway migrations in `backend/src/main/resources/db/migration/`
 |---|---|
 | `V1__create_schema.sql` | Tables, constraints, indexes, triggers |
 | `V2__seed_catalogue.sql` | 8 categories, 8 publishers, 26 books, 30 authors |
+| `V3__checkout_support.sql` | `idempotency_keys` table and `order_number_seq` sequence for checkout |
 
 The schema is verified by `SchemaMigrationTest` (11 tests on a real embedded PostgreSQL). Hibernate runs with `ddl-auto: validate`, so Flyway owns the schema.
 
@@ -265,6 +266,18 @@ Composite primary key (`book_id`, `author_id`). Both are foreign keys with `ON D
 | description | VARCHAR(255) | Y | |
 | created_at | TIMESTAMPTZ | N | No `updated_at`, because rows are append-only. |
 
+### idempotency_keys (added in V3)
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| user_id | BIGINT | N | FK to users (cascade). |
+| operation | VARCHAR(40) | N | For example `CHECKOUT`. Keys are scoped to user + operation. |
+| idempotency_key | VARCHAR(64) | N | Client-chosen, `^[A-Za-z0-9_-]{16,64}$`. `UNIQUE(user_id, operation, idempotency_key)`. |
+| request_hash | VARCHAR(64) | N | SHA-256 (hex) of the normalised request. Detects "same key, different request". |
+| order_id | BIGINT | N | FK to orders (cascade). The order this key produced. |
+| created_at / expires_at | TIMESTAMPTZ | N | A key is remembered for `app.business.idempotency-key-ttl-hours` (24). |
+
+V3 also adds the sequence `order_number_seq`, the source of the running number in order numbers (`EB-yyyyMMdd-NNNN`).
+
 ### reviews (optional)
 | Column | Type | Null | Notes |
 |---|---|---|---|
@@ -300,7 +313,8 @@ Composite primary key (`book_id`, `author_id`). Both are foreign keys with `ON D
 - `gift_point_transactions` is the audit trail. A `BEFORE INSERT` trigger updates `users.points_balance` and stores `balance_after`. Since `users.points_balance` has `CHECK >= 0`, a redemption larger than the balance **fails the whole insert**. The test confirms this.
 - Rows cannot be updated or deleted (trigger `trg_gpt_append_only`). A correction is a new `ADJUST` row.
 - `ux_gpt_once_per_order` allows one `EARN`, one `REDEEM` and one `REFUND` per order. This prevents double crediting when a request is retried.
-- The 50% cap on redemption and the earn rate are service rules.
+- The 50% cap on redemption and the earn rate are service rules (`GiftPointPolicy`), configured in `app.business.*`. See `docs/CHECKOUT_AND_GIFT_POINTS.md`.
+- Checkout appends `REDEEM` rows through a native `INSERT` (`GiftPointTransactionRepository.insertRedeem`), because the trigger fills `balance_after`. The entity is `@Immutable` and read-only.
 
 **Other rules in the database**
 - Cart and order quantities must be between 1 and 100. The business limit of 10 per cart line is applied in the service so it can be configured without a migration.

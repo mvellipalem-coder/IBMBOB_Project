@@ -11,7 +11,10 @@ import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.validation.method.ParameterErrors;
+import org.springframework.core.MethodParameter;
 import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
@@ -46,7 +49,7 @@ public class GlobalExceptionHandler {
         } else {
             log.info("API error {} on {}", code, request.getRequestURI());
         }
-        return build(code, ex.getMessage(), request, null);
+        return build(code, ex.getMessage(), request, ex.getFieldErrors());
     }
 
     /** {@code @Valid} on a request body failed. */
@@ -59,14 +62,38 @@ public class GlobalExceptionHandler {
         return build(ErrorCode.VALIDATION_FAILED, ErrorCode.VALIDATION_FAILED.getDefaultMessage(), request, errors);
     }
 
-    /** Validation of query/path parameters failed (for example {@code size=500}). */
+    /**
+     * Validation of query/path parameters failed (for example {@code size=500}). When a handler has both
+     * constrained parameters and a {@code @Valid} body, Spring reports the body's errors here too; those are
+     * named after the body's fields (for example {@code quantity}), not after the Java parameter.
+     */
     @ExceptionHandler(HandlerMethodValidationException.class)
     public ResponseEntity<ErrorResponse> handleParameterValidation(HandlerMethodValidationException ex,
                                                                    HttpServletRequest request) {
         List<ApiFieldError> errors = ex.getParameterValidationResults().stream()
-                .flatMap(result -> result.getResolvableErrors().stream()
-                        .map(e -> new ApiFieldError(
-                                result.getMethodParameter().getParameterName(), e.getDefaultMessage())))
+                .flatMap(result -> {
+                    if (result instanceof ParameterErrors bodyErrors) {
+                        return bodyErrors.getFieldErrors().stream()
+                                .map(e -> new ApiFieldError(e.getField(), e.getDefaultMessage()));
+                    }
+                    String name = fieldNameOf(result.getMethodParameter());
+                    return result.getResolvableErrors().stream()
+                            .map(e -> new ApiFieldError(name, e.getDefaultMessage()));
+                })
+                .toList();
+        return build(ErrorCode.VALIDATION_FAILED, ErrorCode.VALIDATION_FAILED.getDefaultMessage(), request, errors);
+    }
+
+    /** Method validation interceptor violation on query/path parameters. */
+    @ExceptionHandler(jakarta.validation.ConstraintViolationException.class)
+    public ResponseEntity<ErrorResponse> handleConstraintViolation(jakarta.validation.ConstraintViolationException ex,
+                                                                   HttpServletRequest request) {
+        List<ApiFieldError> errors = ex.getConstraintViolations().stream()
+                .map(v -> {
+                    String path = v.getPropertyPath().toString();
+                    String field = path.contains(".") ? path.substring(path.lastIndexOf('.') + 1) : path;
+                    return new ApiFieldError(field, v.getMessage());
+                })
                 .toList();
         return build(ErrorCode.VALIDATION_FAILED, ErrorCode.VALIDATION_FAILED.getDefaultMessage(), request, errors);
     }
@@ -132,6 +159,18 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex, HttpServletRequest request) {
         log.error("Unexpected error on {}", request.getRequestURI(), ex);
         return build(ErrorCode.INTERNAL_ERROR, ErrorCode.INTERNAL_ERROR.getDefaultMessage(), request, null);
+    }
+
+    /** Headers are reported under their HTTP name (for example {@code Idempotency-Key}), not the Java parameter name. */
+    private static String fieldNameOf(MethodParameter parameter) {
+        RequestHeader header = parameter.getParameterAnnotation(RequestHeader.class);
+        if (header != null) {
+            String name = !header.name().isEmpty() ? header.name() : header.value();
+            if (!name.isEmpty()) {
+                return name;
+            }
+        }
+        return parameter.getParameterName();
     }
 
     private ResponseEntity<ErrorResponse> build(ErrorCode code, String message, HttpServletRequest request,

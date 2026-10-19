@@ -59,6 +59,10 @@ public class SecurityConfig {
                 .requestMatchers(HttpMethod.GET, "/api/health").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/auth/register", "/api/auth/login").permitAll()
                 .requestMatchers(HttpMethod.GET, "/api/books/**", "/api/categories", "/api/publishers").permitAll()
+                // Anything else on the catalogue (POST/PUT/DELETE) is for administrators only. There are no such
+                // handlers yet, but the rule means a future one can never be public by accident.
+                // Anonymous callers get 401, customers get 403.
+                .requestMatchers("/api/books/**", "/api/books", "/api/categories", "/api/publishers").hasRole("ADMIN")
                 .requestMatchers("/openapi.yaml", "/swagger-ui.html", "/swagger-ui/**").permitAll()
                 // Default: deny unless authenticated. New endpoints are protected automatically.
                 .anyRequest().authenticated());

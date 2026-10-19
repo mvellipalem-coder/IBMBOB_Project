@@ -1,5 +1,9 @@
 package com.example.ebookstore.exception;
 
+import java.util.List;
+
+import com.example.ebookstore.dto.ApiFieldError;
+
 /**
  * The one exception that services throw when a business rule or lookup fails.
  *
@@ -10,11 +14,11 @@ package com.example.ebookstore.exception;
 public class ApiException extends RuntimeException {
 
     private final ErrorCode errorCode;
+    private final List<ApiFieldError> fieldErrors;
 
     /** Uses the default message of the error code. */
     public ApiException(ErrorCode errorCode) {
-        super(errorCode.getDefaultMessage());
-        this.errorCode = errorCode;
+        this(errorCode, errorCode.getDefaultMessage(), null);
     }
 
     /**
@@ -22,11 +26,22 @@ public class ApiException extends RuntimeException {
      * The message is sent to the client, so it must never contain secrets or other users' data.
      */
     public ApiException(ErrorCode errorCode, String message) {
+        this(errorCode, message, null);
+    }
+
+    /** A validation problem that belongs to specific request fields (reported in {@code fieldErrors}). */
+    public ApiException(ErrorCode errorCode, String message, List<ApiFieldError> fieldErrors) {
         super(message);
         this.errorCode = errorCode;
+        this.fieldErrors = fieldErrors;
     }
 
     public ErrorCode getErrorCode() {
         return errorCode;
+    }
+
+    /** May be {@code null}. */
+    public List<ApiFieldError> getFieldErrors() {
+        return fieldErrors;
     }
 }

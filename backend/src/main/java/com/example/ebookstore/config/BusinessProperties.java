@@ -1,11 +1,13 @@
 package com.example.ebookstore.config;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
 import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
@@ -25,18 +27,31 @@ import jakarta.validation.constraints.Positive;
  * @param idempotencyKeyTtlHours       hours an Idempotency-Key is remembered (24)
  * @param deliveryDays                 normal delivery time in days (5)
  * @param remoteAreaExtraDays          extra days for remote postal codes (2)
+ * @param remoteAreaPostalPrefixes     postal-code prefixes that count as "remote" (empty by default: the contract
+ *                                     does not name any remote area, so none is invented)
  */
 @Validated
 @ConfigurationProperties(prefix = "app.business")
 public record BusinessProperties(
         @Positive int maxQuantityPerLine,
         @Positive int maxAddressesPerUser,
-        @NotNull @DecimalMin("0.01") BigDecimal pointValue,
+        @NotNull @DecimalMin("0.01") @Digits(integer = 8, fraction = 2) BigDecimal pointValue,
         @Min(0) @Max(100) int maxRedeemPercentOfSubtotal,
-        @NotNull @DecimalMin("0.01") BigDecimal earnAmountPerPoint,
+        @NotNull @DecimalMin("0.01") @Digits(integer = 8, fraction = 2) BigDecimal earnAmountPerPoint,
         @Positive int cancellationWindowHours,
         @Positive int unpaidOrderCancelMinutes,
         @Positive int idempotencyKeyTtlHours,
         @Positive int deliveryDays,
-        @Min(0) int remoteAreaExtraDays) {
+        @Min(0) int remoteAreaExtraDays,
+        List<String> remoteAreaPostalPrefixes) {
+
+    /** Normalises the prefix list once: never null, trimmed, upper case, no blanks. */
+    public BusinessProperties {
+        remoteAreaPostalPrefixes = remoteAreaPostalPrefixes == null ? List.of()
+                : remoteAreaPostalPrefixes.stream()
+                        .map(String::trim)
+                        .filter(prefix -> !prefix.isEmpty())
+                        .map(prefix -> prefix.toUpperCase(java.util.Locale.ROOT))
+                        .toList();
+    }
 }
